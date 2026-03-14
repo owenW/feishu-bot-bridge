@@ -1,0 +1,19 @@
+{
+  "bridge": {
+    "port": 18800
+  },
+  "tailscale": {
+    "socket": "/tmp/tailscaled.sock",
+    "authKey": "tskey-auth-xxxx",
+    "peerIp": "100.x.x.x",
+    "peerPort": 18800,
+    "bin": "tailscale"
+  },
+  "feishu": {
+    "appId": "cli_xxx",
+    "appSecret": "your-app-secret",
+    "groupChatId": "oc_xxx",
+    "peerBotUserId": "ou_xxx",
+    "peerBotName": "OtherBot"
+  }
+}
