@@ -1,67 +1,38 @@
-#!/usr/bin/env node
-/**
- * Feishu Bot-to-Bot Bridge Proxy
- * 
- * Enables bot-to-bot communication in Feishu group chats via Tailscale.
- * Runs as an independent HTTP server — no dependency on agent sessions.
- */
-
 const http = require('http');
 const https = require('https');
 const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
 
-// --- Load Config ---
-const CONFIG_PATH = process.env.BRIDGE_CONFIG || path.join(__dirname, 'config.json');
+const PORT = 18800;
+const TS_SOCKET = '/tmp/tailscaled.sock';
+const PEER_IP = '100.106.199.126';
+const PEER_PORT = 18800;
 
-let config;
-try {
-  config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-} catch (err) {
-  console.error(`Failed to load config from ${CONFIG_PATH}: ${err.message}`);
-  console.error('Copy config.template.json to config.json and fill in your values.');
-  process.exit(1);
-}
+// OpenClaw Gateway (for LLM processing)
+const GATEWAY_PORT = 18789;
+const GATEWAY_TOKEN = '483936709765b34923604dac69b8109b459d1c157ffa1af3';
 
-const PORT = config.bridge?.port || 18800;
-const TS_SOCKET = config.tailscale?.socket || '/tmp/tailscaled.sock';
-const PEER_IP = config.tailscale?.peerIp;
-const PEER_PORT = config.tailscale?.peerPort || 18800;
-const FEISHU_APP_ID = config.feishu?.appId;
-const FEISHU_APP_SECRET = config.feishu?.appSecret;
-const GROUP_CHAT_ID = config.feishu?.groupChatId;
-const PEER_BOT_USER_ID = config.feishu?.peerBotUserId;
-const PEER_BOT_NAME = config.feishu?.peerBotName || 'Bot';
-const TAILSCALE_BIN = config.tailscale?.bin || 'tailscale';
+// Feishu credentials
+const FEISHU_APP_ID = 'cli_a93b9ff91c219bc9';
+const FEISHU_APP_SECRET = 'tDTIlOFyEp5KbGBZYOQdCdwlrXa32idD';
+const GROUP_CHAT_ID = 'oc_997c180ca33a18e1ccdfad6748ec9707';
+const HEDOU_BOT_ID = 'ou_562ceb223426668ee9f6ed20820ec590';
 
-// Validate required config
-const required = { PEER_IP, FEISHU_APP_ID, FEISHU_APP_SECRET, GROUP_CHAT_ID };
-for (const [key, val] of Object.entries(required)) {
-  if (!val) {
-    console.error(`Missing required config: ${key}`);
-    process.exit(1);
-  }
-}
-
-// --- State ---
 let cachedToken = null;
 let tokenExpiry = 0;
 let stats = { nudgesReceived: 0, nudgesSent: 0, errors: 0, startTime: Date.now() };
 
-// --- Server ---
+const SYSTEM_PROMPT = `You are King (科技绿洲龙虾), Owen's strategic AI partner in a Feishu group chat.
+You received a message from another bot (禾斗体育/HeDou) via the Tailscale bridge notification system.
+Reply naturally, concisely, and helpfully. Use the same language as the incoming message.
+You are in a group chat with Owen and HeDou. Be collaborative and professional.
+Keep replies under 200 characters unless more detail is needed.`;
+
 const server = http.createServer(async (req, res) => {
   const body = await getBody(req);
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
-      stats,
-      peer: PEER_IP,
-      ts: Date.now()
-    }));
+    res.end(JSON.stringify({ status: 'ok', uptime: Math.floor((Date.now() - stats.startTime) / 1000), stats, ts: Date.now() }));
     return;
   }
 
@@ -73,15 +44,42 @@ const server = http.createServer(async (req, res) => {
       if (body.type === 'feishu_mention' || body.from) {
         const senderName = body.from || 'Unknown';
         const message = body.message || '(empty)';
-        const chatId = body.chat_id || GROUP_CHAT_ID;
 
-        // Reply in Feishu group
-        const replyText = `收到来自 ${senderName} 的消息：「${message}」`;
-        await sendFeishuMessage(replyText, PEER_BOT_USER_ID, PEER_BOT_NAME, chatId);
+        // Get AI response via OpenClaw gateway
+        let replyText;
+        try {
+          const aiResponse = await callGateway(
+            `${senderName} said in the Feishu group (addressed to you): "${message}"`
+          );
+          const parsed = typeof aiResponse === 'string' ? JSON.parse(aiResponse) : aiResponse;
+          replyText = parsed?.choices?.[0]?.message?.content;
+        } catch (err) {
+          log('LLM call failed, using fallback:', err.message);
+        }
 
+        if (!replyText) {
+          replyText = `收到 ${senderName} 的消息：「${message}」`;
+        }
+
+        // Send reply to Feishu group
+        await sendFeishuMessage(replyText, HEDOU_BOT_ID, '禾斗体育');
         log('Replied in Feishu:', replyText.slice(0, 100));
+
+        // Also send nudge back to notify peer that we replied
+        try {
+          await sendNudgeViaTailscale({
+            type: 'feishu_mention',
+            from: '科技绿洲龙虾 (King)',
+            message: replyText,
+            chat_id: GROUP_CHAT_ID
+          });
+          log('Sent reverse nudge to peer');
+        } catch (e) {
+          log('Reverse nudge failed (non-critical):', e.message);
+        }
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'replied_in_feishu' }));
+        res.end(JSON.stringify({ status: 'replied_in_feishu', reply: replyText.slice(0, 100) }));
       } else {
         log('Generic nudge acknowledged');
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -89,7 +87,7 @@ const server = http.createServer(async (req, res) => {
       }
     } catch (err) {
       stats.errors++;
-      log('ERROR handling nudge:', err.message);
+      log('ERROR:', err.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'error', error: err.message }));
     }
@@ -99,99 +97,101 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/send-nudge') {
     stats.nudgesSent++;
     log('Sending nudge to peer');
-
     try {
       const result = await sendNudgeViaTailscale(body);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'nudge_sent', response: result.slice(0, 200) }));
     } catch (err) {
       stats.errors++;
-      log('ERROR sending nudge:', err.message);
+      log('ERROR sending:', err.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'error', error: err.message }));
     }
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
+  res.writeHead(404);
+  res.end('Not found');
 });
 
-// --- Helpers ---
-function log(...args) {
-  console.log(`[${new Date().toISOString()}]`, ...args);
-}
+function log(...args) { console.log(`[${new Date().toISOString()}]`, ...args); }
 
 function getBody(req) {
   return new Promise((resolve) => {
     let data = '';
     req.on('data', chunk => data += chunk);
-    req.on('end', () => {
-      try { resolve(JSON.parse(data)); } catch { resolve({}); }
+    req.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+  });
+}
+
+// --- OpenClaw Gateway (LLM) ---
+function callGateway(userMessage) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({
+      model: 'anthropic/claude-sonnet-4-20250514',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMessage }
+      ],
+      max_tokens: 512
     });
+
+    const req = http.request({
+      hostname: '127.0.0.1', port: GATEWAY_PORT,
+      path: '/v1/chat/completions', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GATEWAY_TOKEN}`,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    });
+
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(new Error('Gateway timeout 60s')); });
+    req.write(payload);
+    req.end();
   });
 }
 
 // --- Feishu API ---
 async function getFeishuToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-
   const data = await httpsPost('open.feishu.cn', '/open-apis/auth/v3/tenant_access_token/internal', {
-    app_id: FEISHU_APP_ID,
-    app_secret: FEISHU_APP_SECRET
+    app_id: FEISHU_APP_ID, app_secret: FEISHU_APP_SECRET
   });
-
-  if (!data.tenant_access_token) {
-    throw new Error(`Feishu token error: ${JSON.stringify(data)}`);
-  }
-
   cachedToken = data.tenant_access_token;
-  tokenExpiry = Date.now() + (data.expire - 120) * 1000; // refresh 2 min early
-  log('Feishu token refreshed, expires in', data.expire, 'seconds');
+  tokenExpiry = Date.now() + (data.expire - 120) * 1000;
+  log('Feishu token refreshed');
   return cachedToken;
 }
 
-async function sendFeishuMessage(text, mentionUserId, mentionName, chatId) {
+async function sendFeishuMessage(text, mentionUserId, mentionName) {
   const token = await getFeishuToken();
+  let msgText = mentionUserId ? `<at user_id="${mentionUserId}">${mentionName}</at> ${text}` : text;
 
-  let msgText = text;
-  if (mentionUserId) {
-    msgText = `<at user_id="${mentionUserId}">${mentionName || 'user'}</at> ${text}`;
-  }
-
-  const result = await httpsPost(
-    'open.feishu.cn',
+  const result = await httpsPost('open.feishu.cn',
     '/open-apis/im/v1/messages?receive_id_type=chat_id',
-    {
-      receive_id: chatId || GROUP_CHAT_ID,
-      msg_type: 'text',
-      content: JSON.stringify({ text: msgText })
-    },
+    { receive_id: GROUP_CHAT_ID, msg_type: 'text', content: JSON.stringify({ text: msgText }) },
     { 'Authorization': `Bearer ${token}` }
   );
-
-  if (result.code !== 0) {
-    throw new Error(`Feishu send error: code=${result.code} msg=${result.msg}`);
-  }
+  if (result.code !== 0) throw new Error(`Feishu error: ${result.code} ${result.msg}`);
   return result;
 }
 
-function httpsPost(hostname, urlPath, body, extraHeaders = {}) {
+function httpsPost(hostname, path, body, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const req = https.request({
-      hostname, path: urlPath, method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        ...extraHeaders
-      }
+      hostname, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...extraHeaders }
     }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve({ raw: data }); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ raw: data }); } });
     });
     req.on('error', reject);
     req.setTimeout(15000, () => { req.destroy(new Error('Request timeout')); });
@@ -204,59 +204,23 @@ function httpsPost(hostname, urlPath, body, extraHeaders = {}) {
 function sendNudgeViaTailscale(body) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
-    const httpReq = [
-      `POST /nudge HTTP/1.1`,
-      `Host: ${PEER_IP}:${PEER_PORT}`,
-      `Content-Type: application/json`,
-      `Content-Length: ${Buffer.byteLength(payload)}`,
-      `Connection: close`,
-      ``,
-      payload
-    ].join('\r\n');
-
-    const tc = spawn(TAILSCALE_BIN, [
-      '--socket', TS_SOCKET,
-      'nc', PEER_IP, String(PEER_PORT)
-    ]);
-
+    const httpReq = `POST /nudge HTTP/1.1\r\nHost: ${PEER_IP}:${PEER_PORT}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\nConnection: close\r\n\r\n${payload}`;
+    const tc = spawn('/opt/homebrew/bin/tailscale', ['--socket', TS_SOCKET, 'nc', PEER_IP, String(PEER_PORT)]);
     let output = '';
-    let errOutput = '';
-    const timer = setTimeout(() => {
-      tc.kill();
-      reject(new Error(`Tailscale nc timeout (15s) to ${PEER_IP}:${PEER_PORT}`));
-    }, 15000);
-
+    const timer = setTimeout(() => { tc.kill(); reject(new Error('Timeout 15s')); }, 15000);
     tc.stdout.on('data', d => output += d);
-    tc.stderr.on('data', d => errOutput += d);
-
-    tc.on('close', (code) => {
-      clearTimeout(timer);
-      if (errOutput && !output) {
-        reject(new Error(`tailscale nc error: ${errOutput}`));
-      } else {
-        resolve(output || '(empty response)');
-      }
-    });
-
-    tc.on('error', (err) => {
-      clearTimeout(timer);
-      reject(new Error(`spawn error: ${err.message}`));
-    });
-
+    tc.stderr.on('data', d => output += d);
+    tc.on('close', () => { clearTimeout(timer); resolve(output || '(empty)'); });
+    tc.on('error', err => { clearTimeout(timer); reject(err); });
     tc.stdin.write(httpReq);
     tc.stdin.end();
   });
 }
 
-// --- Start ---
 server.listen(PORT, '0.0.0.0', () => {
-  log(`Feishu Bot Bridge running on :${PORT}`);
-  log(`  Peer: ${PEER_IP}:${PEER_PORT}`);
-  log(`  Feishu Group: ${GROUP_CHAT_ID}`);
-  log(`  Tailscale Socket: ${TS_SOCKET}`);
-  log(`  Config: ${CONFIG_PATH}`);
+  log(`Bridge v4 (with LLM) running on :${PORT}`);
+  log(`  Gateway: localhost:${GATEWAY_PORT} | Peer: ${PEER_IP}:${PEER_PORT}`);
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => { log('SIGTERM received, shutting down'); server.close(); process.exit(0); });
-process.on('SIGINT', () => { log('SIGINT received, shutting down'); server.close(); process.exit(0); });
+process.on('SIGTERM', () => { log('Shutting down'); server.close(); process.exit(0); });
+process.on('SIGINT', () => { log('Shutting down'); server.close(); process.exit(0); });
