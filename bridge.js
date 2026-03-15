@@ -7,7 +7,7 @@ const TS_SOCKET = '/tmp/tailscaled.sock';
 const PEER_IP = '100.106.199.126';
 const PEER_PORT = 18800;
 
-// OpenClaw Gateway (for LLM processing)
+// OpenClaw Gateway
 const GATEWAY_PORT = 18789;
 const GATEWAY_TOKEN = '483936709765b34923604dac69b8109b459d1c157ffa1af3';
 
@@ -45,16 +45,27 @@ const server = http.createServer(async (req, res) => {
         const senderName = body.from || 'Unknown';
         const message = body.message || '(empty)';
 
-        // Get AI response via OpenClaw gateway
+        // Get AI response with retry (handles gateway restarts)
         let replyText;
-        try {
-          const aiResponse = await callGateway(
-            `${senderName} said in the Feishu group (addressed to you): "${message}"`
-          );
-          const parsed = typeof aiResponse === 'string' ? JSON.parse(aiResponse) : aiResponse;
-          replyText = parsed?.choices?.[0]?.message?.content;
-        } catch (err) {
-          log('LLM call failed, using fallback:', err.message);
+        const delays = [0, 2000, 8000]; // retry after 0s, 2s, 8s
+        for (let attempt = 0; attempt < delays.length; attempt++) {
+          if (attempt > 0) {
+            log(`LLM retry ${attempt}/${delays.length - 1}, waiting ${delays[attempt]}ms...`);
+            await new Promise(r => setTimeout(r, delays[attempt]));
+          }
+          try {
+            const aiResponse = await callLLM(
+              `${senderName} said in the Feishu group (addressed to you): "${message}"`
+            );
+            const parsed = typeof aiResponse === 'string' ? JSON.parse(aiResponse) : aiResponse;
+            replyText = parsed?.choices?.[0]?.message?.content;
+            if (replyText) break;
+          } catch (err) {
+            log(`LLM attempt ${attempt + 1} failed:`, err.message);
+            if (attempt === delays.length - 1) {
+              log('All LLM retries exhausted, using fallback');
+            }
+          }
         }
 
         if (!replyText) {
@@ -125,10 +136,11 @@ function getBody(req) {
 }
 
 // --- OpenClaw Gateway (LLM) ---
-function callGateway(userMessage) {
+function callLLM(userMessage) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
       model: 'anthropic/claude-sonnet-4-20250514',
+      user: 'bridge-bot',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userMessage }
@@ -142,6 +154,7 @@ function callGateway(userMessage) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${GATEWAY_TOKEN}`,
+        'X-OpenClaw-Channel': 'bridge',
         'Content-Length': Buffer.byteLength(payload)
       }
     }, (res) => {
@@ -219,7 +232,7 @@ function sendNudgeViaTailscale(body) {
 
 server.listen(PORT, '0.0.0.0', () => {
   log(`Bridge v4 (with LLM) running on :${PORT}`);
-  log(`  Gateway: localhost:${GATEWAY_PORT} | Peer: ${PEER_IP}:${PEER_PORT}`);
+  log(`  LLM: Anthropic API direct | Peer: ${PEER_IP}:${PEER_PORT}`);
 });
 
 process.on('SIGTERM', () => { log('Shutting down'); server.close(); process.exit(0); });
